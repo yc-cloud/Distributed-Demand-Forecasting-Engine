@@ -1,0 +1,241 @@
+# ==============================================================================
+# Distributed Demand Forecasting Engine — Pipeline Configuration
+# ==============================================================================
+# All pipeline modules read from this file via a shared utility. No business
+# logic parameter should be hardcoded in Python source files. Changing a value
+# here takes effect across the entire pipeline without touching any module.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# PATHS
+# All paths are relative to the project root. loader.py reads raw_data_file.
+# Intermediate Parquet outputs are written to processed/ and features/ so that
+# individual pipeline stages can be re-run without reprocessing everything from
+# scratch. predictions/ holds the final human-readable and columnar outputs.
+# ------------------------------------------------------------------------------
+paths:
+  # Input: Kaggle CSV downloaded manually into this directory (gitignored)
+  raw_data_dir: "data/raw"
+  raw_data_file: "data/raw/retail_store_inventory.csv"
+
+  # Stage outputs written as Parquet by each pipeline stage
+  processed_data_dir: "data/processed"        # Output of cleaner.py + encoder.py
+  features_data_dir: "data/features"          # Output of all feature engineering modules
+
+  # Final outputs written by writer.py (both Parquet and CSV)
+  predictions_dir: "data/predictions"
+
+  # Serialized model artifact and training metadata written by trainer.py
+  model_dir: "models"
+  model_filename: "xgboost_demand_forecast.joblib"
+  training_metadata_filename: "training_run_metadata.json"
+
+
+# ------------------------------------------------------------------------------
+# SPARK
+# SparkSession is created once in spark_session.py and reused across all stages.
+# local[*] uses all available CPU cores — appropriate for laptop/desktop dev.
+# shuffle_partitions is set low (8) because in local mode the default of 200
+# creates unnecessary overhead; tune upward when running on a cluster.
+# driver_memory and executor_memory are the same in local mode (single JVM).
+# ------------------------------------------------------------------------------
+spark:
+  app_name: "DistributedDemandForecastingEngine"
+  master: "local[*]"
+
+  # Number of partitions used after a shuffle (join, groupBy, window)
+  # Default is 200, which is far too high for a local dataset of 73k rows
+  shuffle_partitions: 8
+
+  # Memory for the driver process (= executor in local mode)
+  driver_memory: "4g"
+  executor_memory: "4g"
+
+  # Log level for the Spark context (separate from application logging below)
+  # Set to WARN to suppress verbose Spark INFO output during development
+  log_level: "WARN"
+
+
+# ------------------------------------------------------------------------------
+# ENCODING
+# Defines the valid domain of each nominal categorical column and the fixed
+# category ordering used by Spark's StringIndexer before OneHotEncoder.
+# Fixing the order here ensures that one-hot column indices are stable across
+# runs — if StringIndexer infers order from data frequency, adding new rows
+# could silently shift column positions and corrupt the trained model.
+#
+# These lists also serve as the schema validation contract in schema_validator.py:
+# any value observed in the data that is not in this list raises an error early.
+# ------------------------------------------------------------------------------
+encoding:
+  # StringIndexer ordering: index 0 = first element, 1 = second, etc.
+  # OneHotEncoder drops the last category (to avoid multicollinearity).
+  # The dropped (reference) category is noted in comments for interpretability.
+
+  category:
+    values: ["Clothing", "Electronics", "Furniture", "Groceries", "Toys"]
+    # Reference category dropped by OHE: Toys
+
+  region:
+    values: ["East", "North", "South", "West"]
+    # Reference category dropped by OHE: West
+
+  weather_condition:
+    values: ["Sunny", "Cloudy", "Rainy", "Snowy"]
+    # Reference category dropped by OHE: Snowy
+
+  seasonality:
+    values: ["Spring", "Summer", "Autumn", "Winter"]
+    # Reference category dropped by OHE: Winter
+
+
+# ------------------------------------------------------------------------------
+# FEATURE ENGINEERING
+# Controls which feature groups are computed and the window sizes used.
+# Lag and rolling windows are defined as lists so that adding or removing a
+# window (e.g., adding a 56-day lag) requires only a config change, not code.
+#
+# Lag windows: how many calendar days back to look for the same store-product.
+#   - lag_1:  captures yesterday's demand (strong short-term signal)
+#   - lag_7:  captures same day last week (day-of-week pattern)
+#   - lag_14: two-week lookback (bi-weekly cycles, e.g. paydays)
+#   - lag_28: four-week lookback (monthly seasonality)
+#
+# Rolling windows: size of the moving average/std window in calendar days.
+#   - 7-day:  short-term trend; responsive to recent demand shifts
+#   - 14-day: medium-term smoothing; reduces noise from single-day spikes
+#   - 28-day: longer-term baseline; captures stable underlying demand level
+#
+# Feature group toggles allow turning off a whole feature group during
+# ablation experiments without deleting code.
+# ------------------------------------------------------------------------------
+feature_engineering:
+  lag_windows: [1, 7, 14, 28]          # Days back; must be positive integers
+  rolling_windows: [7, 14, 28]          # Window sizes in days; must be positive integers
+
+  # Toggle entire feature groups on/off (useful for ablation studies)
+  enable_calendar_features: true        # day_of_week, month, week_of_year, etc.
+  enable_price_features: true           # effective_price, price_to_competitor_ratio, etc.
+
+
+# ------------------------------------------------------------------------------
+# TRAINING
+# holdout_days defines the length of the validation window.
+# The split is computed at runtime as: cutoff_date = max(date) − holdout_days.
+# All records on or before cutoff_date go to train; all records after go to val.
+# This guarantees no future data leaks into the training set.
+#
+# 90 days (≈ 3 months) is chosen because:
+#   - It is long enough to capture seasonal and promotional variation
+#   - It represents a realistic business forecasting horizon
+#   - It is easy to explain in interviews: "I held out the last quarter"
+#
+# random_seed is set globally here so that any stochastic step in the pipeline
+# (e.g., XGBoost subsampling) produces reproducible results across runs.
+# ------------------------------------------------------------------------------
+training:
+  holdout_days: 90        # Number of most-recent days reserved for validation
+  random_seed: 42         # Applied to model training and any other stochastic steps
+
+
+# ------------------------------------------------------------------------------
+# MODEL — XGBoost
+# These are conservative, well-tested defaults for a tabular regression task.
+# They are intentionally not tuned to peak performance; the goal for MVP is
+# a correct, reproducible baseline that demonstrates the pipeline end-to-end.
+#
+# Parameter rationale:
+#   n_estimators    300 trees. Enough for convergence with lr=0.05; low enough
+#                   to train quickly on 73k rows on a laptop.
+#   max_depth       6 is the XGBoost default and works well for tabular data
+#                   with mixed feature types. Deeper trees risk overfitting on
+#                   small store-product partitions.
+#   learning_rate   0.05 is conservative. Lower LR + more trees generalises
+#                   better than high LR + few trees.
+#   subsample       0.8 — row subsampling per tree. Adds regularisation and
+#                   reduces training time.
+#   colsample_bytree 0.8 — feature subsampling per tree. Prevents the model
+#                   from over-relying on any single dominant feature.
+#   min_child_weight 5 — minimum sum of instance weight in a leaf. Prevents
+#                   the tree from creating leaves on very few samples, which
+#                   is important because some store-product pairs have sparse
+#                   demand (units_sold = 0 on many days).
+#   reg_alpha       0.1 — L1 regularisation. Encourages sparse feature weights;
+#                   useful given the large number of one-hot columns.
+#   reg_lambda      1.0 — L2 regularisation (XGBoost default). Smooths weights.
+#   objective       reg:squarederror — standard MSE loss for regression.
+#   eval_metric     rmse — printed during training; RMSE is interpretable in
+#                   the same units as units_sold (number of units).
+#   tree_method     hist — histogram-based approximate splitting; significantly
+#                   faster than exact on datasets > 10k rows.
+# ------------------------------------------------------------------------------
+model:
+  xgboost:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 5
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    objective: "reg:squarederror"
+    eval_metric: "rmse"
+    tree_method: "hist"
+
+
+# ------------------------------------------------------------------------------
+# INVENTORY
+# Parameters consumed by recommender.py to compute safety stock, reorder point,
+# and recommended order quantity. All three are business inputs, not learned
+# from data, so they live here rather than being hardcoded.
+#
+# lead_time_days   The number of calendar days between placing an order and
+#                  receiving the replenishment. Set to 7 (one week) as a
+#                  realistic default for a regional distribution centre.
+#                  Formula usage: reorder_point = (D̄ × L) + safety_stock
+#
+# order_cycle_days The intended interval between replenishment orders — i.e.,
+#                  how many days a single order is expected to cover.
+#                  Set to 30 (monthly cycle) as a common retail default.
+#                  Formula usage: recommended_order_qty = (D̄ × T) + safety_stock
+#                  IMPORTANT: this is distinct from lead_time_days. Lead time
+#                  determines the reorder trigger; order cycle determines volume.
+#
+# service_level_z  The Z-score corresponding to the target in-stock probability.
+#                  1.65 → 95% service level (industry standard for fast-moving
+#                  consumer goods). Use 1.28 for 90% or 2.05 for 98%.
+#                  Formula usage: safety_stock = Z × σ × √lead_time_days
+# ------------------------------------------------------------------------------
+inventory:
+  lead_time_days: 7           # Days from order placement to stock arrival (L)
+  order_cycle_days: 30        # Days one replenishment order is intended to cover (T)
+  service_level_z: 1.65       # Z-score for 95% in-stock service level (Z)
+
+
+# ------------------------------------------------------------------------------
+# OUTPUT
+# Controls what writer.py produces. Both formats are written by default:
+#   - Parquet: columnar, compressed, efficient for downstream Spark/pandas reads
+#   - CSV: human-readable, easy to open in Excel for portfolio presentation
+# Filenames are set without extensions; writer.py appends the correct suffix
+# for each format (e.g., demand_forecast.parquet, demand_forecast.csv).
+# ------------------------------------------------------------------------------
+output:
+  forecast_filename: "demand_forecast"
+  inventory_filename: "inventory_recommendations"
+  write_parquet: true     # Always recommended for production-style pipelines
+  write_csv: true         # Convenience format for portfolio / manual inspection
+
+
+# ------------------------------------------------------------------------------
+# LOGGING
+# Used by all src/ modules via Python's standard logging module.
+# The format includes timestamp, level, and module name so that log lines from
+# different pipeline stages are easy to distinguish in a single run output.
+# ------------------------------------------------------------------------------
+logging:
+  level: "INFO"                         # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
