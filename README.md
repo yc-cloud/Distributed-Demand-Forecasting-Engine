@@ -130,20 +130,50 @@ Where:
 
 ## How to Run
 
-### Setup
+### 1. Setup Environment
+
+Create and activate a virtual environment, then install dependencies:
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
 
-### Run pipeline
-#### Fair model:
+---
+
+### 2. Run Pipeline
+
+#### Fair Model (ML-only, no external forecast)
+
 ```bash
 python pipeline.py
+```
 
-#### Enhanced model:
+#### Enhanced Model (uses `demand_forecast` feature)
+
 ```bash
 python pipeline.py --use-baseline-feature
+```
 
+---
+
+### 3. Output Artifacts
+
+After running, the pipeline will generate:
+
+- Model:
+  - `models/fair_xgboost_demand_forecast.joblib`
+  - `models/enhanced_xgboost_demand_forecast.joblib`
+
+- Evaluation metrics:
+  - `models/evaluation_metrics.json`
+
+- Predictions:
+  - `data/predictions/demand_forecast.parquet`
+  - `data/predictions/demand_forecast.csv`
+
+- Inventory recommendations:
+  - `data/predictions/inventory_recommendations.parquet`
+  - `data/predictions/inventory_recommendations.csv`
 
