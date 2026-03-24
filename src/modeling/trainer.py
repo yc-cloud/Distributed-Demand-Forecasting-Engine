@@ -176,6 +176,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import joblib
+import pandas as pd
 import yaml
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -193,7 +194,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 TARGET_COLUMN: str = "units_sold"
 
-FEATURE_COLUMNS: list[str] = [
+BASE_FEATURE_COLUMNS: list[str] = [
     # ── Inventory / operations ─────────────────────────────────────────────
     "inventory_level",
     "units_ordered",
@@ -218,6 +219,8 @@ FEATURE_COLUMNS: list[str] = [
     "region_encoded",
     "weather_encoded",
     "seasonality_encoded",
+    "store_id_encoded",
+    "product_id_encoded",
     # ── Lag features ──────────────────────────────────────────────────────
     "lag_1",
     "lag_7",
@@ -231,6 +234,28 @@ FEATURE_COLUMNS: list[str] = [
     "rolling_mean_28",
     "rolling_std_28",
 ]
+
+DEMAND_FORECAST_FEATURE: str = "demand_forecast"
+
+def get_feature_columns(use_baseline_feature: bool = False) -> list[str]:
+    """
+    Returns the list of feature columns based on the model variant.
+
+    Parameters
+    ----------
+    use_baseline_feature : bool, default False
+        If True, includes 'demand_forecast' as a feature (Enhanced model).
+        If False, excludes 'demand_forecast' (Fair model).
+
+    Returns
+    -------
+    list[str]
+        A list of feature column names.
+    """
+    if use_baseline_feature:
+        return BASE_FEATURE_COLUMNS + [DEMAND_FORECAST_FEATURE]
+    else:
+        return BASE_FEATURE_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +345,7 @@ def _time_split(df: DataFrame, cutoff_date):
     return train_df, val_df
 
 
-def _to_pandas(spark_df: DataFrame):
+def _to_pandas(spark_df: DataFrame, feature_columns: list[str]) -> tuple[pd.DataFrame, pd.Series]:
     """
     Select the training matrix columns and convert to a pandas DataFrame.
 
@@ -346,10 +371,10 @@ def _to_pandas(spark_df: DataFrame):
     tuple[pd.DataFrame, pd.Series]
         (X, y) where X is the feature matrix and y is the target vector.
     """
-    columns_to_select = FEATURE_COLUMNS + [TARGET_COLUMN]
+    columns_to_select = feature_columns + [TARGET_COLUMN]
     pdf = spark_df.select(columns_to_select).toPandas()
 
-    X = pdf[FEATURE_COLUMNS]
+    X = pdf[feature_columns]
     y = pdf[TARGET_COLUMN]
     return X, y
 
@@ -361,6 +386,7 @@ def _to_pandas(spark_df: DataFrame):
 def train(
     df: DataFrame,
     config_path: str = "config/config.yaml",
+    use_baseline_feature: bool = False,
 ) -> XGBRegressor:
     """
     Train an XGBoost regressor on the feature-engineered DataFrame.
@@ -402,6 +428,10 @@ def train(
     xgb_cfg      = cfg["model"]["xgboost"]
     paths_cfg    = cfg["paths"]
 
+    # Determine feature columns based on the model variant
+    feature_columns = get_feature_columns(use_baseline_feature)
+    model_variant = "enhanced" if use_baseline_feature else "fair"
+
     holdout_days = training_cfg["holdout_days"]
     random_seed  = training_cfg["random_seed"]
 
@@ -420,10 +450,10 @@ def train(
 
     # ── 3. Collect to pandas (triggers Spark execution) ──────────────────────
     logger.info("Converting train split to pandas…")
-    X_train, y_train = _to_pandas(train_spark)
+    X_train, y_train = _to_pandas(train_spark, feature_columns)
 
     logger.info("Converting validation split to pandas…")
-    X_val, y_val = _to_pandas(val_spark)
+    X_val, y_val = _to_pandas(val_spark, feature_columns)
 
     if len(X_train) == 0:
         raise ValueError(
@@ -436,7 +466,7 @@ def train(
         "Split complete | train_rows=%d | val_rows=%d | features=%d",
         len(X_train),
         len(X_val),
-        len(FEATURE_COLUMNS),
+        len(feature_columns),
     )
 
     # ── 4. Build and fit XGBoost model ───────────────────────────────────────
@@ -480,7 +510,8 @@ def train(
     model_dir = Path(paths_cfg["model_dir"])
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = model_dir / paths_cfg["model_filename"]
+    model_filename = f"{model_variant}_{paths_cfg['model_filename']}"
+    model_path = model_dir / model_filename
     joblib.dump(model, model_path)
     logger.info("Model saved | path=%s", model_path)
 
@@ -494,14 +525,17 @@ def train(
         "holdout_days":       holdout_days,
         "train_row_count":    len(X_train),
         "val_row_count":      len(X_val),
-        "feature_count":      len(FEATURE_COLUMNS),
-        "feature_columns":    FEATURE_COLUMNS,
+        "feature_count":      len(feature_columns),
+        "feature_columns":    feature_columns,
         "target_column":      TARGET_COLUMN,
         "model_parameters":   xgb_cfg,
         "random_seed":        random_seed,
+        "model_variant":      model_variant,
+        "use_baseline_feature": use_baseline_feature,
     }
 
-    metadata_path = model_dir / paths_cfg["training_metadata_filename"]
+    metadata_filename = f"{model_variant}_{paths_cfg['training_metadata_filename']}"
+    metadata_path = model_dir / metadata_filename
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Training metadata saved | path=%s", metadata_path)

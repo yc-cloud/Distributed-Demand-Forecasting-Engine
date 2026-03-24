@@ -22,7 +22,7 @@ undetected.
 
 This is prevented here by importing FEATURE_COLUMNS directly from trainer.py:
 
-    from src.modeling.trainer import FEATURE_COLUMNS
+    from src.modeling.trainer import get_feature_columns
 
 Both training and inference execute `spark_df.select(FEATURE_COLUMNS)` from the
 same list.  Adding, removing, or reordering a feature requires changing only one
@@ -143,7 +143,7 @@ import pandas as pd
 import yaml
 from pyspark.sql import DataFrame
 
-from src.modeling.trainer import FEATURE_COLUMNS
+from src.modeling.trainer import get_feature_columns
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ def _load_model(model_path: Path):
     return model
 
 
-def _collect_to_pandas(spark_df: DataFrame) -> pd.DataFrame:
+def _collect_to_pandas(spark_df: DataFrame, feature_columns: list[str]) -> pd.DataFrame:
     """
     Select the required columns and collect the Spark DataFrame to pandas.
 
@@ -247,11 +247,17 @@ def _collect_to_pandas(spark_df: DataFrame) -> pd.DataFrame:
         Pandas DataFrame with 36 columns (29 features + 7 key columns).
         Row count equals the input Spark DataFrame row count.
     """
-    columns_to_collect = KEY_COLUMNS + FEATURE_COLUMNS
+    all_columns = KEY_COLUMNS + feature_columns
+    columns_to_collect = []
+    seen = set()
+    for col in all_columns:
+        if col not in seen:
+            columns_to_collect.append(col)
+            seen.add(col)
     logger.info(
         "Selecting %d columns before toPandas | features=%d | key_columns=%d",
         len(columns_to_collect),
-        len(FEATURE_COLUMNS),
+        len(feature_columns),
         len(KEY_COLUMNS),
     )
     pdf = spark_df.select(columns_to_collect).toPandas()
@@ -266,6 +272,7 @@ def _collect_to_pandas(spark_df: DataFrame) -> pd.DataFrame:
 def predict(
     df: DataFrame,
     config_path: str = "config/config.yaml",
+    use_baseline_feature: bool = False,
 ) -> pd.DataFrame:
     """
     Run batch inference on a feature-engineered Spark DataFrame.
@@ -309,11 +316,17 @@ def predict(
     cfg = _load_config(Path(config_path))
     paths_cfg = cfg["paths"]
 
-    model_path = Path(paths_cfg["model_dir"]) / paths_cfg["model_filename"]
+    # Determine feature columns based on the model variant
+    feature_columns = get_feature_columns(use_baseline_feature)
+    model_variant = "enhanced" if use_baseline_feature else "fair"
+
+    # Construct the model filename based on the variant
+    model_filename = f"{model_variant}_{paths_cfg['model_filename']}"
+    model_path = Path(paths_cfg["model_dir"]) / model_filename
     model = _load_model(model_path)
 
     # ── Validate that required columns are present ────────────────────────────
-    required_columns = set(KEY_COLUMNS + FEATURE_COLUMNS)
+    required_columns = set(KEY_COLUMNS + feature_columns)
     missing = required_columns - set(df.columns)
     if missing:
         raise ValueError(
@@ -323,18 +336,18 @@ def predict(
         )
 
     # ── Collect feature + key columns to pandas ───────────────────────────────
-    pdf = _collect_to_pandas(df)
+    pdf = _collect_to_pandas(df, feature_columns)
 
     # ── Build the feature matrix in the exact training column order ───────────
     # pdf[FEATURE_COLUMNS] reproduces the same 29-column matrix that was passed
     # to model.fit() in trainer.py — same columns, same order.
-    X = pdf[FEATURE_COLUMNS]
+    X = pdf[feature_columns].to_numpy()
 
     # ── Run inference ─────────────────────────────────────────────────────────
     logger.info(
         "Running inference | rows=%d | features=%d",
         len(X),
-        len(FEATURE_COLUMNS),
+        len(feature_columns),
     )
     raw_predictions = model.predict(X)   # numpy array, float32
 

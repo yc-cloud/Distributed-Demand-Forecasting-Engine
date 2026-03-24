@@ -158,7 +158,7 @@ def _configure_logging(config_path: Path) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config_path: str = "config/config.yaml") -> dict:
+def run_pipeline(config_path: str = "config/config.yaml", use_baseline_feature: bool = False) -> dict:
     """
     Execute the full demand forecasting pipeline end-to-end.
 
@@ -236,16 +236,17 @@ def run_pipeline(config_path: str = "config/config.yaml") -> dict:
 
         # ── Stage 9: Train model ──────────────────────────────────────────────
         logger.info("Stage 9/14 | Training XGBoost model")
-        train(feature_df, config_path=config_path)
+        train(feature_df, config_path=config_path, use_baseline_feature=use_baseline_feature)
 
-        artifacts["model_path"]    = model_dir / cfg["paths"]["model_filename"]
-        artifacts["metadata_path"] = model_dir / cfg["paths"]["training_metadata_filename"]
+        model_variant = "enhanced" if use_baseline_feature else "fair"
+        artifacts["model_path"]    = model_dir / f"{model_variant}_{cfg["paths"]["model_filename"]}"
+        artifacts["metadata_path"] = model_dir / f"{model_variant}_{cfg["paths"]["training_metadata_filename"]}"
         logger.info("Model artifact  : %s", artifacts["model_path"])
         logger.info("Training metadata: %s", artifacts["metadata_path"])
 
         # ── Stage 10: Generate predictions ───────────────────────────────────
         logger.info("Stage 10/14 | Generating predictions")
-        predictions_df = predict(feature_df, config_path=config_path)
+        predictions_df = predict(feature_df, config_path=config_path, use_baseline_feature=use_baseline_feature)
         logger.info("Predictions shape: %s", predictions_df.shape)
 
         # ── Stage 11: Evaluate predictions ───────────────────────────────────
@@ -329,9 +330,14 @@ if __name__ == "__main__":
         default="config/config.yaml",
         help="Path to config.yaml (default: config/config.yaml)",
     )
+    parser.add_argument(
+        "--use-baseline-feature",
+        action="store_true",
+        help="Use demand_forecast as a feature for the Enhanced model (default: False)",
+    )
     args = parser.parse_args()
 
-    artifacts = run_pipeline(config_path=args.config)
+    artifacts = run_pipeline(config_path=args.config, use_baseline_feature=args.use_baseline_feature)
 
     print("\nArtifacts written:")
     print(f"  Model          : {artifacts.get('model_path')}")

@@ -140,6 +140,7 @@ import yaml
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType
+from pyspark.sql.window import Window
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,19 @@ ENCODING_TARGETS: list[tuple[str, str, str]] = [
     ("region",            "region",            "region_encoded"),
     ("weather_condition", "weather_condition", "weather_encoded"),
     ("seasonality",       "seasonality",       "seasonality_encoded"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Encoding targets
+#
+# These columns will be encoded dynamically based on their distinct values
+# in the DataFrame. This is suitable for high-cardinality IDs like store_id
+# and product_id where pre-defining all values in config.yaml is impractical.
+# ---------------------------------------------------------------------------
+DYNAMIC_ENCODING_TARGETS: list[tuple[str, str]] = [
+    ("store_id", "store_id_encoded"),
+    ("product_id", "product_id_encoded"),
 ]
 
 
@@ -253,6 +267,28 @@ def _make_label_encoder(column_name: str, values: list[str]) -> "Column":
     return F.create_map(*flat_pairs).getItem(F.col(column_name)).cast(IntegerType())
 
 
+def _make_dynamic_label_encoder(column_name: str) -> "Column":
+    """
+    Build a Spark Column expression that maps string values to integer indices
+    dynamically based on their occurrence in the DataFrame.
+
+    Uses dense_rank() over a window partitioned by the column to be encoded.
+    This assigns a unique, consecutive integer ID to each distinct value.
+
+    Parameters
+    ----------
+    column_name : str
+        Name of the source column in the DataFrame (e.g. "store_id").
+
+    Returns
+    -------
+    pyspark.sql.Column
+        A Column expression of IntegerType.
+    """
+    window_spec = Window.orderBy(column_name)
+    return F.dense_rank().over(window_spec) - 1 # -1 to make it 0-indexed
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -307,10 +343,13 @@ def encode(df: DataFrame, config_path: str = "config/config.yaml") -> DataFrame:
     """
     encoding_cfg = _load_encoding_config(Path(config_path))
 
+    all_encoded_cols = [output_col for _, _, output_col in ENCODING_TARGETS] + \
+                       [output_col for _, output_col in DYNAMIC_ENCODING_TARGETS]
     logger.info(
-        "Encoding started | input_columns=%d | targets=%s",
+        "Encoding started | input_columns=%d | config_targets=%s | dynamic_targets=%s",
         len(df.columns),
         [output_col for _, _, output_col in ENCODING_TARGETS],
+        [output_col for _, output_col in DYNAMIC_ENCODING_TARGETS],
     )
 
     for config_key, source_col, output_col in ENCODING_TARGETS:
@@ -325,16 +364,26 @@ def encode(df: DataFrame, config_path: str = "config/config.yaml") -> DataFrame:
         df = df.withColumn(output_col, encoder_expr)
 
         logger.debug(
-            "Encoded '%s' → '%s' | mapping=%s",
+            "Encoded '%s' → '%s' (config-driven) | mapping=%s",
             source_col,
             output_col,
             {v: i for i, v in enumerate(values)},
         )
 
+    for source_col, output_col in DYNAMIC_ENCODING_TARGETS:
+        encoder_expr = _make_dynamic_label_encoder(source_col)
+        df = df.withColumn(output_col, encoder_expr)
+
+        logger.debug(
+            "Encoded '%s' → '%s' (dynamic)",
+            source_col,
+            output_col,
+        )
+
     logger.info(
         "Encoding complete | output_columns=%d | encoded_columns=%s",
         len(df.columns),
-        [output_col for _, _, output_col in ENCODING_TARGETS],
+        all_encoded_cols,
     )
 
     return df
