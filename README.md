@@ -136,3 +136,14 @@ Where:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+### Run pipeline
+#### Fair model:
+```bash
+python pipeline.py
+
+#### Enhanced model:
+```bash
+python pipeline.py --use-baseline-feature
+
+
