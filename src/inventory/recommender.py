@@ -465,6 +465,11 @@ def recommend(
         how="inner",
         validate="1:1",   # assert each entity appears once in both sides
     )
+    # Rename to match the expected column name in _compute_inventory_metrics()
+    # and the output schema.  The source column is named inventory_level in
+    # the Spark DataFrame; current_inventory_level makes its semantics
+    # ("today's on-hand stock") explicit throughout all downstream code.
+    merged = merged.rename(columns={"inventory_level": "current_inventory_level"})
 
     n_demand  = len(demand_agg)
     n_merged  = len(merged)
